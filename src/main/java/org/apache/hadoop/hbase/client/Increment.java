@@ -29,7 +29,6 @@ import java.util.TreeMap;
 
 import org.apache.hadoop.hbase.io.TimeRange;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.io.Writable;
 
 /**
  * Used to perform Increment operations on a single row.
@@ -79,6 +78,19 @@ public class Increment implements Row {
     if(rowLock != null) {
       this.lockId = rowLock.getLockId();
     }
+  }
+  
+  /**
+   * Constructor for cloning
+   * @param incrementToCopy
+   */
+  public Increment(Increment incrementToCopy) {
+      this(incrementToCopy.getRow(), incrementToCopy.getRowLock());
+      for (Map.Entry<byte[], NavigableMap<byte[], Long>> entry : incrementToCopy.getFamilyMap().entrySet()) {
+          this.familyMap.put(entry.getKey(), entry.getValue());
+      }
+      this.writeToWAL = incrementToCopy.getWriteToWAL();
+      this.tr = incrementToCopy.getTimeRange();
   }
 
   /**

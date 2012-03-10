@@ -29,6 +29,7 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.HTable;
+import org.apache.hadoop.hbase.client.Increment;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.io.Writable;
@@ -40,7 +41,7 @@ import org.apache.hadoop.mapreduce.TaskAttemptContext;
 
 /**
  * Convert Map/Reduce output and write it to an HBase table. The KEY is ignored
- * while the output value <u>must</u> be either a {@link Put} or a
+ * while the output value <u>must</u> be either an {@link Increment}, a {@link Put} or a
  * {@link Delete} instance.
  *
  * @param <KEY>  The type of the key. Ignored in this class.
@@ -120,9 +121,10 @@ implements Configurable {
     @Override
     public void write(KEY key, Writable value)
     throws IOException {
-      if (value instanceof Put) this.table.put(new Put((Put)value));
+      if (value instanceof Increment) this.table.increment(new Increment((Increment)value));
+      else if (value instanceof Put) this.table.put(new Put((Put)value));
       else if (value instanceof Delete) this.table.delete(new Delete((Delete)value));
-      else throw new IOException("Pass a Delete or a Put");
+      else throw new IOException("Pass an Increment, a Delete or a Put");
     }
   }
 
