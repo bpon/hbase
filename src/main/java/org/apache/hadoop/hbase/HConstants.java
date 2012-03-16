@@ -228,7 +228,7 @@ public final class HConstants {
       "hbase.hregion.max.filesize";
 
   /** Default maximum file size */
-  public static final long DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024;
+  public static final long DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024L;
 
   /**
    * The max number of threads used for opening and closing stores or store
@@ -635,6 +635,10 @@ public final class HConstants {
    */
   public static final String CHECKSUM_TYPE_NAME =
       "hbase.hstore.checksum.algorithm";
+
+  /** Configuration name of HLog Compression */
+  public static final String ENABLE_WAL_COMPRESSION =
+    "hbase.regionserver.wal.enablecompression";
 
   private HConstants() {
     // Can't be instantiated with this ctor.
