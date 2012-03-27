@@ -1304,22 +1304,22 @@ public class HRegion implements HeapSize { // , Writable{
         status.setStatus("Running coprocessor pre-flush hooks");
         coprocessorHost.preFlush();
       }
-      try {
-        synchronized (writestate) {
-          if (!writestate.flushing && writestate.writesEnabled) {
-            this.writestate.flushing = true;
-          } else {
-            if (LOG.isDebugEnabled()) {
-              LOG.debug("NOT flushing memstore for region " + this +
-                  ", flushing=" +
-                  writestate.flushing + ", writesEnabled=" +
-                  writestate.writesEnabled);
-            }
-            status.abort("Not flushing since " +
-                (writestate.flushing ? "already flushing" : "writes not enabled"));
-            return false;
+      synchronized (writestate) {
+        if (!writestate.flushing && writestate.writesEnabled) {
+          this.writestate.flushing = true;
+        } else {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("NOT flushing memstore for region " + this
+                + ", flushing=" + writestate.flushing + ", writesEnabled="
+                + writestate.writesEnabled);
           }
+          status.abort("Not flushing since "
+              + (writestate.flushing ? "already flushing"
+                  : "writes not enabled"));
+          return false;
         }
+      }
+      try {
         boolean result = internalFlushcache(status);
 
         if (coprocessorHost != null) {
@@ -3472,6 +3472,23 @@ public class HRegion implements HeapSize { // , Writable{
 
     KeyValueHeap getStoreHeapForTesting() {
       return storeHeap;
+    }
+
+    @Override
+    public synchronized boolean reseek(byte[] row) throws IOException {
+      if (row == null) {
+        throw new IllegalArgumentException("Row cannot be null.");
+      }
+      startRegionOperation();
+      try {
+        // This could be a new thread from the last time we called next().
+        MultiVersionConsistencyControl.setThreadReadPoint(this.readPt);
+        KeyValue kv = KeyValue.createFirstOnRow(row);
+        // use request seek to make use of the lazy seek option. See HBASE-5520
+        return this.storeHeap.requestSeek(kv, true, true);
+      } finally {
+        closeRegionOperation();
+      }
     }
   }
 

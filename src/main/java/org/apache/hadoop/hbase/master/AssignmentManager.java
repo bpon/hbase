@@ -147,7 +147,7 @@ public class AssignmentManager extends ZooKeeperListener {
    * Server to regions assignment map.
    * Contains the set of regions currently assigned to a given server.
    * This Map and {@link #regions} are tied.  Always update this in tandem
-   * with the other under a lock on {@link #regions}
+   * with the other under a lock on {@link #regions}.
    * @see #regions
    */
   private final NavigableMap<ServerName, Set<HRegionInfo>> servers =
@@ -157,7 +157,7 @@ public class AssignmentManager extends ZooKeeperListener {
    * Region to server assignment map.
    * Contains the server a given region is currently assigned to.
    * This Map and {@link #servers} are tied.  Always update this in tandem
-   * with the other under a lock on {@link #regions}
+   * with the other under a lock on {@link #regions}.
    * @see #servers
    */
   private final SortedMap<HRegionInfo, ServerName> regions =
@@ -1029,8 +1029,9 @@ public class AssignmentManager extends ZooKeeperListener {
           regionInfo = regionState.getRegion();
         } else {
           try {
-            regionInfo = MetaReader.getRegion(catalogTracker,
-                data.getRegionName()).getFirst();
+            byte[] name = data.getRegionName();
+            Pair<HRegionInfo, ServerName> p = MetaReader.getRegion(catalogTracker, name);
+            regionInfo = p.getFirst();
           } catch (IOException e) {
             LOG.info("Exception reading META doing HBCK repair operation", e);
             return;
@@ -1117,7 +1118,7 @@ public class AssignmentManager extends ZooKeeperListener {
         if (rs.isSplitting() || rs.isSplit()) {
           LOG.debug("Ephemeral node deleted, regionserver crashed?, " +
             "clearing from RIT; rs=" + rs);
-          clearRegionFromTransition(rs.getRegion());
+          regionOffline(rs.getRegion());
         } else {
           LOG.debug("The znode of region " + regionInfo.getRegionNameAsString()
               + " has been deleted.");
@@ -1585,6 +1586,7 @@ public class AssignmentManager extends ZooKeeperListener {
           if (isDisabledorDisablingRegionInRIT(region)) {
             return;
           }
+          setEnabledTable(region);
         }
       }
       
@@ -2199,6 +2201,14 @@ public class AssignmentManager extends ZooKeeperListener {
     LOG.info("Bulk assigning done");
   }
 
+  private void setEnabledTable(HRegionInfo hri) {
+    String tableName = hri.getTableNameAsString();
+    boolean isTableEnabled = this.zkTable.isEnabledTable(tableName);
+    if (!isTableEnabled) {
+      setEnabledTable(tableName);
+    }    
+  }
+
   /**
    * Assigns all user regions, if any exist.  Used during cluster startup.
    * <p>
@@ -2234,6 +2244,9 @@ public class AssignmentManager extends ZooKeeperListener {
     } else {
       // assign regions in round-robin fashion
       assignUserRegions(new ArrayList<HRegionInfo>(allRegions.keySet()), servers);
+      for (HRegionInfo hri : allRegions.keySet()) {
+        setEnabledTable(hri);
+      }
       return;
     }
     LOG.info("Bulk assigning " + allRegions.size() + " region(s) across " +
@@ -2242,6 +2255,9 @@ public class AssignmentManager extends ZooKeeperListener {
     // Use fixed count thread pool assigning.
     BulkAssigner ba = new StartupBulkAssigner(this.master, bulkPlan, this);
     ba.bulkAssign();
+    for (HRegionInfo hri : allRegions.keySet()) {
+      setEnabledTable(hri);
+    }
     LOG.info("Bulk assigning done");
   }
 
@@ -2435,12 +2451,15 @@ public class AssignmentManager extends ZooKeeperListener {
       new TreeMap<ServerName, List<Pair<HRegionInfo, Result>>>();
     // Iterate regions in META
     for (Result result : results) {
+      boolean disabled = false;
+      boolean disablingOrEnabling = false;
       Pair<HRegionInfo, ServerName> region = MetaReader.parseCatalogResult(result);
       if (region == null) continue;
       HRegionInfo regionInfo = region.getFirst();
       ServerName regionLocation = region.getSecond();
       if (regionInfo == null) continue;
       String tableName = regionInfo.getTableNameAsString();
+      if (regionInfo.isOffline() && regionInfo.isSplit()) continue;
       if (regionLocation == null) {
         // regionLocation could be null if createTable didn't finish properly.
         // When createTable is in progress, HMaster restarts.
@@ -2468,6 +2487,13 @@ public class AssignmentManager extends ZooKeeperListener {
           offlineServers.put(regionLocation, offlineRegions);
         }
         offlineRegions.add(new Pair<HRegionInfo,Result>(regionInfo, result));
+        disabled = checkIfRegionBelongsToDisabled(regionInfo);
+        disablingOrEnabling = addTheTablesInPartialState(this.disablingTables,
+            this.enablingTables, regionInfo, tableName);
+        // need to enable the table if not disabled or disabling or enabling
+        // this will be used in rolling restarts
+        enableTableIfNotDisabledOrDisablingOrEnabling(disabled,
+            disablingOrEnabling, tableName);
       } else {
         // Region is being served and on an active server
         // add only if region not in disabled and enabling table
@@ -2476,21 +2502,37 @@ public class AssignmentManager extends ZooKeeperListener {
           regions.put(regionInfo, regionLocation);
           addToServers(regionLocation, regionInfo);
         }
-        addTheTablesInPartialState(this.disablingTables, this.enablingTables, regionInfo,
-            tableName);
+        disablingOrEnabling = addTheTablesInPartialState(this.disablingTables,
+            this.enablingTables, regionInfo, tableName);
+        disabled = checkIfRegionBelongsToDisabled(regionInfo);
+        // need to enable the table if not disabled or disabling or enabling
+        // this will be used in rolling restarts
+        enableTableIfNotDisabledOrDisablingOrEnabling(disabled,
+            disablingOrEnabling, tableName);
       }
     }
     return offlineServers;
   }
 
-  private void addTheTablesInPartialState(Set<String> disablingTables,
+  private void enableTableIfNotDisabledOrDisablingOrEnabling(boolean disabled,
+      boolean disablingOrEnabling, String tableName) {
+    if (!disabled && !disablingOrEnabling
+        && !getZKTable().isEnabledTable(tableName)) {
+      setEnabledTable(tableName);
+    }
+  }
+
+  private Boolean addTheTablesInPartialState(Set<String> disablingTables,
       Set<String> enablingTables, HRegionInfo regionInfo,
       String disablingTableName) {
     if (checkIfRegionBelongsToDisabling(regionInfo)) {
       disablingTables.add(disablingTableName);
+      return true;
     } else if (checkIfRegionsBelongsToEnabling(regionInfo)) {
       enablingTables.add(disablingTableName);
-    }
+      return true;
+    } 
+    return false;
   }
 
   /**
@@ -2680,7 +2722,10 @@ public class AssignmentManager extends ZooKeeperListener {
 
   /**
    * Clears the specified region from being in transition.
+   * <p>
    * @param hri Region to remove.
+   * @deprecated This is a dupe of {@link #regionOffline(HRegionInfo)}.
+   *   Please use that method instead.
    */
   public void clearRegionFromTransition(HRegionInfo hri) {
     synchronized (this.regionsInTransition) {
@@ -2738,8 +2783,10 @@ public class AssignmentManager extends ZooKeeperListener {
    */
   public List<HRegionInfo> getRegionsOfTable(byte[] tableName) {
     List<HRegionInfo> tableRegions = new ArrayList<HRegionInfo>();
+    // boundary needs to have table's name but regionID 0 so that it is sorted 
+    // before all table's regions.
     HRegionInfo boundary =
-      new HRegionInfo(tableName, null, null);
+      new HRegionInfo(tableName, null, null, false, 0L);
     synchronized (this.regions) {
       for (HRegionInfo regionInfo: this.regions.tailMap(boundary).keySet()) {
         if(Bytes.equals(regionInfo.getTableName(), tableName)) {
@@ -3305,6 +3352,18 @@ public class AssignmentManager extends ZooKeeperListener {
   public void shutdown() {
     if (null != threadPoolExecutorService) {
       this.threadPoolExecutorService.shutdown();
+    }
+  }
+
+  protected void setEnabledTable(String tableName) {
+    try {
+      this.zkTable.setEnabledTable(tableName);
+    } catch (KeeperException e) {
+      // here we can abort as it is the start up flow
+      String errorMsg = "Unable to ensure that the table " + tableName
+          + " will be" + " enabled because of a ZooKeeper issue";
+      LOG.error(errorMsg);
+      this.master.abort(errorMsg, e);
     }
   }
 }

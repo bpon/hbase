@@ -624,6 +624,9 @@ Server {
       this.assignmentManager.regionOnline(HRegionInfo.ROOT_REGIONINFO,
         this.catalogTracker.getRootLocation());
     }
+    // Enable the ROOT table if on process fail over the RS containing ROOT
+    // was active.
+    enableCatalogTables(Bytes.toString(HConstants.ROOT_TABLE_NAME));
     LOG.info("-ROOT- assigned=" + assigned + ", rit=" + rit +
       ", location=" + catalogTracker.getRootLocation());
 
@@ -649,10 +652,17 @@ Server {
       this.assignmentManager.regionOnline(HRegionInfo.FIRST_META_REGIONINFO,
         this.catalogTracker.getMetaLocation());
     }
+    enableCatalogTables(Bytes.toString(HConstants.META_TABLE_NAME));
     LOG.info(".META. assigned=" + assigned + ", rit=" + rit +
       ", location=" + catalogTracker.getMetaLocation());
     status.setStatus("META and ROOT assigned.");
     return assigned;
+  }
+
+  private void enableCatalogTables(String catalogTableName) {
+    if (!this.assignmentManager.getZKTable().isEnabledTable(catalogTableName)) {
+      this.assignmentManager.setEnabledTable(catalogTableName);
+    }
   }
 
   void fixupDaughters(final MonitoredTask status) throws IOException {
@@ -1408,7 +1418,7 @@ Server {
 
   public void clearFromTransition(HRegionInfo hri) {
     if (this.assignmentManager.isRegionInTransition(hri) != null) {
-      this.assignmentManager.clearRegionFromTransition(hri);
+      this.assignmentManager.regionOffline(hri);
     }
   }
 
@@ -1756,7 +1766,7 @@ Server {
       }
     }
     if (force) {
-      this.assignmentManager.clearRegionFromTransition(hri);
+      this.assignmentManager.regionOffline(hri);
       assignRegion(hri);
     } else {
       this.assignmentManager.unassign(hri, force);
@@ -1810,6 +1820,18 @@ Server {
    */
   public double getAverageLoad() {
     return this.assignmentManager.getAverageLoad();
+  }
+
+  /**
+   * Special method, only used by hbck.
+   */
+  @Override
+  public void offline(final byte[] regionName) throws IOException {
+    Pair<HRegionInfo, ServerName> pair =
+      MetaReader.getRegion(this.catalogTracker, regionName);
+    if (pair == null) throw new UnknownRegionException(Bytes.toStringBinary(regionName));
+    HRegionInfo hri = pair.getFirst();
+    this.assignmentManager.regionOffline(hri);
   }
 
   /**

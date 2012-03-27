@@ -58,6 +58,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.io.HbaseObjectWritable;
 import org.apache.hadoop.hbase.io.WritableWithSize;
 import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandler;
@@ -73,6 +74,8 @@ import org.apache.hadoop.util.StringUtils;
 
 import com.google.common.base.Function;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+
+import org.cliffc.high_scale_lib.Counter;
 
 /** An abstract IPC service.  IPC calls take a single {@link Writable} as a
  * parameter, and return a {@link Writable} as their value.  A service runs on
@@ -94,7 +97,13 @@ public abstract class HBaseServer implements RpcServer {
   /**
    * How many calls/handler are allowed in the queue.
    */
-  private static final int DEFAULT_MAX_QUEUE_SIZE_PER_HANDLER = 10;
+  private static final int DEFAULT_MAX_CALLQUEUE_LENGTH_PER_HANDLER = 10;
+
+  /**
+   * The maximum size that we can hold in the IPC queue
+   */
+  private static final int DEFAULT_MAX_CALLQUEUE_SIZE =
+    1024 * 1024 * 1024;
 
   static final int BUFFER_INITIAL_SIZE = 1024;
 
@@ -190,13 +199,16 @@ public abstract class HBaseServer implements RpcServer {
 
   protected Configuration conf;
 
+  private int maxQueueLength;
   private int maxQueueSize;
   protected int socketSendBufferSize;
   protected final boolean tcpNoDelay;   // if T then disable Nagle's Algorithm
   protected final boolean tcpKeepAlive; // if T then use keepalives
+  protected final long purgeTimeout;    // in milliseconds
 
   volatile protected boolean running = true;         // true while server runs
   protected BlockingQueue<Call> callQueue; // queued calls
+  protected final Counter callQueueSize = new Counter();
   protected BlockingQueue<Call> priorityCallQueue;
 
   protected int highPriorityLevel;  // what level a high priority call is at
@@ -255,10 +267,11 @@ public abstract class HBaseServer implements RpcServer {
     protected Responder responder;
     protected boolean delayReturnValue;           // if the return value should be
                                                   // set at call completion
+    protected long size;                          // size of current call
     protected boolean isError;
 
     public Call(int id, Writable param, Connection connection,
-        Responder responder) {
+        Responder responder, long size) {
       this.id = id;
       this.param = param;
       this.connection = connection;
@@ -267,6 +280,7 @@ public abstract class HBaseServer implements RpcServer {
       this.delayResponse = false;
       this.responder = responder;
       this.isError = false;
+      this.size = size;
     }
 
     @Override
@@ -397,6 +411,10 @@ public abstract class HBaseServer implements RpcServer {
     @Override
     public synchronized boolean isReturnValueDelayed() {
       return this.delayReturnValue;
+    }
+
+    public long getSize() {
+      return this.size;
     }
 
     /**
@@ -749,8 +767,6 @@ public abstract class HBaseServer implements RpcServer {
     private final Selector writeSelector;
     private int pending;         // connections waiting to register
 
-    final static int PURGE_INTERVAL = 900000; // 15mins
-
     Responder() throws IOException {
       this.setName("IPC Server Responder");
       this.setDaemon(true);
@@ -780,7 +796,7 @@ public abstract class HBaseServer implements RpcServer {
       while (running) {
         try {
           waitPending();     // If a channel is being registered, wait.
-          writeSelector.select(PURGE_INTERVAL);
+          writeSelector.select(purgeTimeout);
           Iterator<SelectionKey> iter = writeSelector.selectedKeys().iterator();
           while (iter.hasNext()) {
             SelectionKey key = iter.next();
@@ -794,7 +810,7 @@ public abstract class HBaseServer implements RpcServer {
             }
           }
           long now = System.currentTimeMillis();
-          if (now < lastPurgeTime + PURGE_INTERVAL) {
+          if (now < lastPurgeTime + purgeTimeout) {
             continue;
           }
           lastPurgeTime = now;
@@ -882,7 +898,7 @@ public abstract class HBaseServer implements RpcServer {
         Iterator<Call> iter = call.connection.responseQueue.listIterator(0);
         while (iter.hasNext()) {
           Call nextCall = iter.next();
-          if (now > nextCall.timestamp + PURGE_INTERVAL) {
+          if (now > nextCall.timestamp + purgeTimeout) {
             closeConnection(nextCall.connection);
             break;
           }
@@ -1197,7 +1213,7 @@ public abstract class HBaseServer implements RpcServer {
         // we return 0 which will keep the socket up -- bad clients, unless
         // they switch to suit the running server -- will fail later doing
         // getProtocolVersion.
-        Call fakeCall =  new Call(0, null, this, responder);
+        Call fakeCall =  new Call(0, null, this, responder, 0);
         // Versions 3 and greater can interpret this exception
         // response in the same manner
         setupResponse(buffer, fakeCall, Status.FATAL,
@@ -1229,9 +1245,23 @@ public abstract class HBaseServer implements RpcServer {
       DataInputStream dis =
         new DataInputStream(new ByteArrayInputStream(buf));
       int id = dis.readInt();                    // try to read an id
+      long callSize = buf.length;
 
-      if (LOG.isDebugEnabled())
-        LOG.debug(" got call #" + id + ", " + buf.length + " bytes");
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(" got call #" + id + ", " + callSize + " bytes");
+      }
+
+      // Enforcing the call queue size, this triggers a retry in the client
+      if ((callSize + callQueueSize.get()) > maxQueueSize) {
+        final Call callTooBig =
+          new Call(id, null, this, responder, callSize);
+        ByteArrayOutputStream responseBuffer = new ByteArrayOutputStream();
+        setupResponse(responseBuffer, callTooBig, Status.FATAL, null,
+            IOException.class.getName(),
+            "Call queue is full, is ipc.server.max.callqueue.size too small?");
+        responder.doRespond(callTooBig);
+        return;
+      }
 
       Writable param;
       try {
@@ -1240,7 +1270,8 @@ public abstract class HBaseServer implements RpcServer {
       } catch (Throwable t) {
         LOG.warn("Unable to read call parameters for client " +
                  getHostAddress(), t);
-        final Call readParamsFailedCall = new Call(id, null, this, responder);
+        final Call readParamsFailedCall =
+          new Call(id, null, this, responder, callSize);
         ByteArrayOutputStream responseBuffer = new ByteArrayOutputStream();
 
         setupResponse(responseBuffer, readParamsFailedCall, Status.FATAL, null,
@@ -1249,7 +1280,8 @@ public abstract class HBaseServer implements RpcServer {
         responder.doRespond(readParamsFailedCall);
         return;
       }
-      Call call = new Call(id, param, this, responder);
+      Call call = new Call(id, param, this, responder, callSize);
+      callQueueSize.add(callSize);
 
       if (priorityCallQueue != null && getQosLevel(param) > highPriorityLevel) {
         priorityCallQueue.put(call);
@@ -1353,7 +1385,7 @@ public abstract class HBaseServer implements RpcServer {
             RequestContext.clear();
           }
           CurCall.set(null);
-
+          callQueueSize.add(call.getSize() * -1);
           // Set the response for undelayed calls and delayed calls with
           // undelayed responses.
           if (!call.isDelayed() || !call.isReturnValueDelayed()) {
@@ -1436,15 +1468,29 @@ public abstract class HBaseServer implements RpcServer {
     this.handlerCount = handlerCount;
     this.priorityHandlerCount = priorityHandlerCount;
     this.socketSendBufferSize = 0;
+
+    // temporary backward compatibility
+    String oldMaxQueueSize = this.conf.get("ipc.server.max.queue.size");
+    if (oldMaxQueueSize == null) {
+      this.maxQueueLength =
+        this.conf.getInt("ipc.server.max.callqueue.length",
+          handlerCount * DEFAULT_MAX_CALLQUEUE_LENGTH_PER_HANDLER);
+    } else {
+      LOG.warn("ipc.server.max.queue.size was renamed " +
+               "ipc.server.max.callqueue.length, " +
+               "please update your configuration");
+      this.maxQueueLength = Integer.getInteger(oldMaxQueueSize);
+    }
+
     this.maxQueueSize =
-      this.conf.getInt("ipc.server.max.queue.size",
-        handlerCount * DEFAULT_MAX_QUEUE_SIZE_PER_HANDLER);
+      this.conf.getInt("ipc.server.max.callqueue.size",
+        DEFAULT_MAX_CALLQUEUE_SIZE);
      this.readThreads = conf.getInt(
         "ipc.server.read.threadpool.size",
         10);
-    this.callQueue  = new LinkedBlockingQueue<Call>(maxQueueSize);
+    this.callQueue  = new LinkedBlockingQueue<Call>(maxQueueLength);
     if (priorityHandlerCount > 0) {
-      this.priorityCallQueue = new LinkedBlockingQueue<Call>(maxQueueSize); // TODO hack on size
+      this.priorityCallQueue = new LinkedBlockingQueue<Call>(maxQueueLength); // TODO hack on size
     } else {
       this.priorityCallQueue = null;
     }
@@ -1452,6 +1498,8 @@ public abstract class HBaseServer implements RpcServer {
     this.maxIdleTime = 2*conf.getInt("ipc.client.connection.maxidletime", 1000);
     this.maxConnectionsToNuke = conf.getInt("ipc.client.kill.max", 10);
     this.thresholdIdleConnections = conf.getInt("ipc.client.idlethreshold", 4000);
+    this.purgeTimeout = conf.getLong("ipc.client.call.purge.timeout",
+                                     2 * HConstants.DEFAULT_HBASE_RPC_TIMEOUT);
 
     // Start the listener here and let it bind to the port
     listener = new Listener();
