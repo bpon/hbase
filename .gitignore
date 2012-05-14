@@ -10,3 +10,5 @@
 *.iml
 *.orig
 *~
+release.properties
+*.releaseBackup
