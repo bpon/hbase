@@ -137,6 +137,7 @@ import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.InfoServer;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.Sleeper;
+import org.apache.hadoop.hbase.util.Strings;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.util.VersionInfo;
 import org.apache.hadoop.hbase.zookeeper.ClusterStatusTracker;
@@ -372,9 +373,9 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
     this.stopped = false;
 
     // Server to handle client requests.
-    String hostname = DNS.getDefaultHost(
+    String hostname = Strings.domainNamePointerToHostName(DNS.getDefaultHost(
       conf.get("hbase.regionserver.dns.interface", "default"),
-      conf.get("hbase.regionserver.dns.nameserver", "default"));
+      conf.get("hbase.regionserver.dns.nameserver", "default")));
     int port = conf.getInt(HConstants.REGIONSERVER_PORT,
       HConstants.DEFAULT_REGIONSERVER_PORT);
     // Creation of a HSA will force a resolve.
@@ -584,12 +585,6 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
    */
   private void blockAndCheckIfStopped(ZooKeeperNodeTracker tracker)
       throws IOException, InterruptedException {
-    if (false == tracker.checkIfBaseNodeAvailable()) {
-      String errorMsg = "Check the value configured in 'zookeeper.znode.parent'. "
-          + "There could be a mismatch with the one configured in the master.";
-      LOG.error(errorMsg);
-      abort(errorMsg);
-    }
     while (tracker.blockUntilAvailable(this.msgInterval, false) == null) {
       if (this.stopped) {
         throw new IOException("Received the shutdown message while waiting.");
@@ -1740,8 +1735,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
     try {
       for (Map.Entry<String, HRegion> e: this.onlineRegions.entrySet()) {
         HRegion r = e.getValue();
-        if (!r.getRegionInfo().isMetaRegion()) {
-          if (r.isClosed() || r.isClosing()) continue;
+        if (!r.getRegionInfo().isMetaRegion() && r.isAvailable()) {
           // Don't update zk with this close transition; pass false.
           closeRegion(r.getRegionInfo(), abort, false);
         }
@@ -1779,12 +1773,15 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
   /** {@inheritDoc} */
   public Result get(byte[] regionName, Get get) throws IOException {
     checkOpen();
+    final long startTime = System.nanoTime();
     requestCount.incrementAndGet();
     try {
       HRegion region = getRegion(regionName);
       return region.get(get, getLockFromId(get.getLockId()));
     } catch (Throwable t) {
       throw convertThrowableToIOE(cleanup(t));
+    } finally {
+      this.metrics.getLatencies.update(System.nanoTime() - startTime);
     }
   }
 
@@ -1816,6 +1813,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
       throw new IllegalArgumentException("update has null row");
     }
 
+    final long startTime = System.nanoTime();
     checkOpen();
     this.requestCount.incrementAndGet();
     HRegion region = getRegion(regionName);
@@ -1827,6 +1825,8 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
       region.put(put, getLockFromId(put.getLockId()), writeToWAL);
     } catch (Throwable t) {
       throw convertThrowableToIOE(cleanup(t));
+    } finally {
+      this.metrics.putLatencies.update(System.nanoTime() - startTime);
     }
   }
 
@@ -1834,6 +1834,9 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
       throws IOException {
     checkOpen();
     HRegion region = null;
+    int i = 0;
+
+    final long startTime = System.nanoTime();
     try {
       region = getRegion(regionName);
       if (!region.getRegionInfo().isMetaTable()) {
@@ -1843,7 +1846,6 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
       @SuppressWarnings("unchecked")
       Pair<Put, Integer>[] putsWithLocks = new Pair[puts.size()];
 
-      int i = 0;
       for (Put p : puts) {
         Integer lock = getLockFromId(p.getLockId());
         putsWithLocks[i++] = new Pair<Put, Integer>(p, lock);
@@ -1859,6 +1861,14 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
       return -1;
     } catch (Throwable t) {
       throw convertThrowableToIOE(cleanup(t));
+    } finally {
+      // going to count this as puts.size() PUTs for latency calculations
+      final long totalTime = System.nanoTime() - startTime;
+      final long putCount = i;
+      final long perPutTime = totalTime / putCount;
+      for (int request = 0; request < putCount; request++) {
+        this.metrics.putLatencies.update(perPutTime);
+      }
     }
   }
 
@@ -2068,7 +2078,16 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
         s = r.getScanner(scan);
       }
       if (r.getCoprocessorHost() != null) {
-        s = r.getCoprocessorHost().postScannerOpen(scan, s);
+        if (r.getCoprocessorHost() != null) {
+          RegionScanner savedScanner = r.getCoprocessorHost().postScannerOpen(
+              scan, s);
+          if (savedScanner == null) {
+            LOG.warn("PostScannerOpen impl returning null. "
+                + "Check the RegionObserver implementation.");
+          } else {
+            s = savedScanner;
+          }
+        }
       }
       return addScanner(s);
     } catch (Throwable t) {
@@ -2249,6 +2268,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
   public void delete(final byte[] regionName, final Delete delete)
       throws IOException {
     checkOpen();
+    final long startTime = System.nanoTime();
     try {
       boolean writeToWAL = delete.getWriteToWAL();
       this.requestCount.incrementAndGet();
@@ -2260,6 +2280,8 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
       region.delete(delete, lid, writeToWAL);
     } catch (Throwable t) {
       throw convertThrowableToIOE(cleanup(t));
+    } finally {
+      this.metrics.deleteLatencies.update(System.nanoTime() - startTime);
     }
   }
 
@@ -2277,10 +2299,12 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
       int size = deletes.size();
       Integer[] locks = new Integer[size];
       for (Delete delete : deletes) {
+        final long startTime = System.nanoTime();
         this.requestCount.incrementAndGet();
         locks[i] = getLockFromId(delete.getLockId());
         region.delete(delete, locks[i], delete.getWriteToWAL());
         i++;
+        this.metrics.deleteLatencies.update(System.nanoTime() - startTime);
       }
     } catch (WrongRegionException ex) {
       LOG.debug("Batch deletes: " + i, ex);
@@ -2453,9 +2477,9 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
     }
     LOG.info("Received request to open region: " +
       region.getRegionNameAsString());
+    HTableDescriptor htd = this.tableDescriptors.get(region.getTableName());
     this.regionsInTransitionInRS.putIfAbsent(region.getEncodedNameAsBytes(),
         true);
-    HTableDescriptor htd = this.tableDescriptors.get(region.getTableName());
     // Need to pass the expected version in the constructor.
     if (region.isRootRegion()) {
       this.service.submit(new OpenRootHandler(this, this, region, htd,
@@ -2788,6 +2812,15 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
   public HRegion getFromOnlineRegions(final String encodedRegionName) {
     HRegion r = null;
     r = this.onlineRegions.get(encodedRegionName);
+
+    // all accesses to a region (get/put/delete/scan/etc) go through here, so
+    // this is a (very rough) way to determine which regions are most accessed.
+    // ideally, we'll later break down accesses by operation type but this will
+    // do for a first pass
+    if (r != null) {
+      this.metrics.regionAccessCounter.update(encodedRegionName);
+    }
+    
     return r;
   }
 
@@ -2845,7 +2878,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
   protected HRegionInfo[] getMostLoadedRegions() {
     ArrayList<HRegionInfo> regions = new ArrayList<HRegionInfo>();
     for (HRegion r : onlineRegions.values()) {
-      if (r.isClosed() || r.isClosing()) {
+      if (!r.isAvailable()) {
         continue;
       }
       if (regions.size() < numRegionsToReport) {

@@ -61,13 +61,13 @@ import org.apache.hadoop.hbase.DroppedSnapshotException;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HConstants.OperationStatusCode;
 import org.apache.hadoop.hbase.HDFSBlocksDistribution;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.NotServingRegionException;
 import org.apache.hadoop.hbase.UnknownScannerException;
-import org.apache.hadoop.hbase.HConstants.OperationStatusCode;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Increment;
@@ -78,17 +78,18 @@ import org.apache.hadoop.hbase.client.RowLock;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.coprocessor.Exec;
 import org.apache.hadoop.hbase.client.coprocessor.ExecResult;
+import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.IncompatibleFilterException;
-import org.apache.hadoop.hbase.filter.NullComparator;
 import org.apache.hadoop.hbase.filter.WritableByteArrayComparable;
-import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.io.HeapSize;
 import org.apache.hadoop.hbase.io.TimeRange;
 import org.apache.hadoop.hbase.io.hfile.BlockCache;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.ipc.CoprocessorProtocol;
 import org.apache.hadoop.hbase.ipc.HBaseRPC;
+import org.apache.hadoop.hbase.ipc.HBaseServer;
+import org.apache.hadoop.hbase.ipc.RpcCallContext;
 import org.apache.hadoop.hbase.monitoring.MonitoredTask;
 import org.apache.hadoop.hbase.monitoring.TaskMonitor;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest;
@@ -276,6 +277,7 @@ public class HRegion implements HeapSize { // , Writable{
   long memstoreFlushSize;
   private volatile long lastFlushTime;
   final RegionServerServices rsServices;
+  private RegionServerAccounting rsAccounting;
   private List<Pair<Long, Long>> recentFlushes = new ArrayList<Pair<Long,Long>>();
   private long blockingMemStoreSize;
   final long threadWakeFrequency;
@@ -368,6 +370,9 @@ public class HRegion implements HeapSize { // , Writable{
     // don't initialize coprocessors if not running within a regionserver
     // TODO: revisit if coprocessors should load in other cases
     if (rsServices != null) {
+      this.rsAccounting = this.rsServices.getRegionServerAccounting();
+      // don't initialize coprocessors if not running within a regionserver
+      // TODO: revisit if coprocessors should load in other cases
       this.coprocessorHost = new RegionCoprocessorHost(this, rsServices, conf);
     }
     if (LOG.isDebugEnabled()) {
@@ -594,13 +599,8 @@ public class HRegion implements HeapSize { // , Writable{
    * @return the size of memstore in this region
    */
   public long addAndGetGlobalMemstoreSize(long memStoreSize) {
-    if (this.rsServices != null) {
-      RegionServerAccounting rsAccounting =
-        this.rsServices.getRegionServerAccounting();
-
-      if (rsAccounting != null) {
-        rsAccounting.addAndGetGlobalMemstoreSize(memStoreSize);
-      }
+    if (this.rsAccounting != null) {
+      rsAccounting.addAndGetGlobalMemstoreSize(memStoreSize);
     }
     return this.memstoreSize.getAndAdd(memStoreSize);
   }
@@ -666,6 +666,16 @@ public class HRegion implements HeapSize { // , Writable{
    */
   public boolean isClosing() {
     return this.closing.get();
+  }
+
+  /** @return true if region is available (not closed and not closing) */
+  public boolean isAvailable() {
+    return !isClosed() && !isClosing();
+  }
+
+  /** @return true if region is splittable */
+  public boolean isSplittable() {
+    return isAvailable() && !hasReferences();
   }
 
   boolean areWritesEnabled() {
@@ -1672,10 +1682,12 @@ public class HRegion implements HeapSize { // , Writable{
     T[] operations;
     int nextIndexToProcess = 0;
     OperationStatus[] retCodeDetails;
+    WALEdit[] walEditsFromCoprocessors;
 
     public BatchOperationInProgress(T[] operations) {
       this.operations = operations;
       this.retCodeDetails = new OperationStatus[operations.length];
+      this.walEditsFromCoprocessors = new WALEdit[operations.length];
       Arrays.fill(this.retCodeDetails, OperationStatus.NOT_RUN);
     }
 
@@ -1712,14 +1724,20 @@ public class HRegion implements HeapSize { // , Writable{
     BatchOperationInProgress<Pair<Put, Integer>> batchOp =
       new BatchOperationInProgress<Pair<Put,Integer>>(putsAndLocks);
 
+    boolean initialized = false;
+
     while (!batchOp.isDone()) {
       checkReadOnly();
       checkResources();
 
       long newSize;
       startRegionOperation();
-      this.writeRequestsCount.increment();
       try {
+        if (!initialized) {
+          this.writeRequestsCount.increment();
+          doPrePutHook(batchOp);
+          initialized = true;
+        }
         long addedSize = doMiniBatchPut(batchOp);
         newSize = this.addAndGetGlobalMemstoreSize(addedSize);
       } finally {
@@ -1732,23 +1750,32 @@ public class HRegion implements HeapSize { // , Writable{
     return batchOp.retCodeDetails;
   }
 
-  @SuppressWarnings("unchecked")
-  private long doMiniBatchPut(
-      BatchOperationInProgress<Pair<Put, Integer>> batchOp) throws IOException {
-
-    WALEdit walEdit = new WALEdit();
+  private void doPrePutHook(BatchOperationInProgress<Pair<Put, Integer>> batchOp)
+      throws IOException {
     /* Run coprocessor pre hook outside of locks to avoid deadlock */
+    WALEdit walEdit = new WALEdit();
     if (coprocessorHost != null) {
       for (int i = 0; i < batchOp.operations.length; i++) {
         Pair<Put, Integer> nextPair = batchOp.operations[i];
         Put put = nextPair.getFirst();
         if (coprocessorHost.prePut(put, walEdit, put.getWriteToWAL())) {
           // pre hook says skip this Put
-          // mark as success and skip below
+          // mark as success and skip in doMiniBatchPut
           batchOp.retCodeDetails[i] = OperationStatus.SUCCESS;
+        }
+        if (!walEdit.isEmpty()) {
+          batchOp.walEditsFromCoprocessors[i] = walEdit;
+          walEdit = new WALEdit();
         }
       }
     }
+  }
+
+  @SuppressWarnings("unchecked")
+  private long doMiniBatchPut(
+      BatchOperationInProgress<Pair<Put, Integer>> batchOp) throws IOException {
+
+    WALEdit walEdit = new WALEdit();
 
     long now = EnvironmentEdgeManager.currentTimeMillis();
     byte[] byteNow = Bytes.toBytes(now);
@@ -1844,6 +1871,13 @@ public class HRegion implements HeapSize { // , Writable{
 
         Put p = batchOp.operations[i].getFirst();
         if (!p.getWriteToWAL()) continue;
+        // Add WAL edits by CP
+        WALEdit fromCP = batchOp.walEditsFromCoprocessors[i];
+        if (fromCP != null) {
+          for (KeyValue kv : fromCP.getKeyValues()) {
+            walEdit.add(kv);
+          }
+        }
         addFamilyMapToWALEdit(familyMaps[i], walEdit);
       }
 
@@ -2306,6 +2340,13 @@ public class HRegion implements HeapSize { // , Writable{
           throw e;
         }
       }
+      // The edits size added into rsAccounting during this replaying will not
+      // be required any more. So just clear it.
+      if (this.rsAccounting != null) {
+        this.rsAccounting.clearRegionReplayEditsSize(this.regionInfo
+            .getRegionName());
+      }
+      
     }
     if (seqid > minSeqId) {
       // Then we added some edits to memory. Flush and cleanup split edit files.
@@ -2487,7 +2528,11 @@ public class HRegion implements HeapSize { // , Writable{
    * @return True if we should flush.
    */
   protected boolean restoreEdit(final Store s, final KeyValue kv) {
-    return isFlushSize(this.addAndGetGlobalMemstoreSize(s.add(kv)));
+    long kvSize = s.add(kv);
+    if (this.rsAccounting != null) {
+      rsAccounting.addAndGetRegionReplayEditsSize(this.regionInfo.getRegionName(), kvSize);
+    }
+    return isFlushSize(this.addAndGetGlobalMemstoreSize(kvSize));
   }
 
   /*
@@ -2926,7 +2971,16 @@ public class HRegion implements HeapSize { // , Writable{
     }
 
     private boolean nextInternal(int limit) throws IOException {
+      RpcCallContext rpcCall = HBaseServer.getCurrentCall();
       while (true) {
+        if (rpcCall != null) {
+          // If a user specifies a too-restrictive or too-slow scanner, the
+          // client might time out and disconnect while the server side
+          // is still processing the request. We should abort aggressively
+          // in that case.
+          rpcCall.throwExceptionIfCallerDisconnected();
+        }
+
         byte [] currentRow = peekRow();
         if (isStopRow(currentRow)) {
           if (filter != null && filter.hasFilterRow()) {
@@ -3070,7 +3124,11 @@ public class HRegion implements HeapSize { // , Writable{
    * bootstrap code in the HMaster constructor.
    * Note, this method creates an {@link HLog} for the created region. It
    * needs to be closed explicitly.  Use {@link HRegion#getLog()} to get
-   * access.
+   * access.  <b>When done with a region created using this method, you will
+   * need to explicitly close the {@link HLog} it created too; it will not be
+   * done for you.  Not closing the log will leave at least a daemon thread
+   * running.</b>  Call {@link #closeHRegion(HRegion)} and it will do
+   * necessary cleanup for you.
    * @param info Info for region to create.
    * @param rootDir Root directory for HBase instance
    * @param conf
@@ -3083,6 +3141,23 @@ public class HRegion implements HeapSize { // , Writable{
       final Configuration conf, final HTableDescriptor hTableDescriptor)
   throws IOException {
     return createHRegion(info, rootDir, conf, hTableDescriptor, null);
+  }
+
+  /**
+   * This will do the necessary cleanup a call to {@link #createHRegion(HRegionInfo, Path, Configuration, HTableDescriptor)}
+   * requires.  This method will close the region and then close its
+   * associated {@link HLog} file.  You use it if you call the other createHRegion,
+   * the one that takes an {@link HLog} instance but don't be surprised by the
+   * call to the {@link HLog#closeAndDelete()} on the {@link HLog} the
+   * HRegion was carrying.
+   * @param r
+   * @throws IOException
+   */
+  public static void closeHRegion(final HRegion r) throws IOException {
+    if (r == null) return;
+    r.close();
+    if (r.getLog() == null) return;
+    r.getLog().closeAndDelete();
   }
 
   /**
@@ -3916,7 +3991,7 @@ public class HRegion implements HeapSize { // , Writable{
   public static final long FIXED_OVERHEAD = ClassSize.align(
       ClassSize.OBJECT +
       ClassSize.ARRAY +
-      30 * ClassSize.REFERENCE + Bytes.SIZEOF_INT +
+      31 * ClassSize.REFERENCE + Bytes.SIZEOF_INT +
       (4 * Bytes.SIZEOF_LONG) +
       Bytes.SIZEOF_BOOLEAN);
 

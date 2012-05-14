@@ -15,16 +15,70 @@ Release 0.92.2 - Unreleased
                to an inexistent cluster
    HBASE-5624  Aborting regionserver when splitting region, may cause daughter
                region not assigned by ServerShutdownHandler (Chunhui Shen)
-   HBASE-5615  The master never does balance because of balancing the parent region (Xufeng)
+   HBASE-5596  Few minor bugs from HBASE-5209 (David S. Wang)
+   HBASE-5669  AggregationClient fails validation for open stoprow scan
+               (Mubarak Seyed)
+   HBASE-5638  Backport HBASE-5633: NPE reading ZK config in HBase (Matteo Bertozzi)
+   HBASE-4398  If HRegionPartitioner is used in MapReduce, client side configurations
+               are overwritten by hbase-site.xml (Takuya Ueshin)
+   HBASE-5535  Make the functions in task monitor synchronized (Liyin Tang)
+   HBASE-5213  "hbase master stop" does not bring down backup masters (Gregory) 
+   HBASE-5606  SplitLogManger async delete node hangs log splitting when ZK connection is lost
+               (Prakash)
+   HBASE-5724  Row cache of KeyValue should be cleared in readFields().
+               (Teruyoshi Zenmyo)
+   HBASE-5680  Improve compatibilty warning about HBase with Hadoop 0.23.x
+   HBASE-5735  Clearer warning message when connecting a non-secure HBase client to a
+               secure HBase server (Shaneal Manek)
+   HBASE-5618  SplitLogManager - prevent unnecessary attempts to resubmits
+               (Prakash Khemani)
+   HBASE-5748  Enable lib directory in jar file for coprocessor (Takuya Ueshin)
+   HBASE-5758  Forward port "HBASE-4109 Hostname returned via reverse dns lookup
+               contains trailing period if configured interface is not 'default'"
+   HBASE-5773  HtablePool constructor not reading config files in certain cases
+               (Ioan Eugen Stan)
+   HBASE-5488  OfflineMetaRepair doesn't support hadoop 0.20's fs.default.name property (gaojinchao)
+   HBASE-5781  Zookeeper session got closed while trying to assign the region to RS using hbck -fix
+   HBASE-5793  TestHBaseFsck#TestNoHdfsTable test hangs after client retries increased
+   HBASE-5780  Fix race in HBase regionserver startup vs ZK SASL authentication (Shaneal Manek)
+   HBASE-5823  HBASE-5823 Hbck should be able to print help (Enis Soztutar)
+   HBASE-5787  Table owner can't disable/delete its own table (Matteo)
+   HBASE-5821  Incorrect handling of null value in Coprocessor aggregation function min() (Maryann Xue)
+   HBASE-5833  0.92 build has been failing pretty consistently on TestMasterFailover
+   HBASE-5857  RIT map in RS not getting cleared while region opening (Chinna Rao)
+   HBASE-5850  Refuse operations from Admin before master is initialized - fix for all branches (xufeng)
+   HBASE-5863  Improve the graceful_stop.sh CLI help (especially about reloads)
+               (Harsh J)
+   HBASE-5849  On first cluster startup, RS aborts if root znode is not available
+               (Enis Soztutar)
+   HBASE-5871  Usability regression, we don't parse compression algos anymore (Lars H)
+   HBASE-5873  TimeOut Monitor thread should be started after atleast one region server registers. (rajeshbabu)
+   HBASE-5893  Allow spaces in coprocessor conf (aka trim() className) (Matteo Bertozzi)
+   HBASE-5611  Replayed edits from regions that failed to open during recovery aren't removed from
+               the global MemStore size (Jieshan)
+   HBASE-5897  prePut coprocessor hook causing substantial CPU usage (Todd)
+   HBASE-5883  Backup master is going down due to connection refused exception (Jieshan)
+   HBASE-5928  Hbck shouldn't npe when there are no tables (Elliott Clark)
+   HBASE-5894  Table deletion failed but HBaseAdmin#deletetable reports it as success (Xufeng)
+   HBASE-5942  HConnnectionManager.getRegionServerWithRetries doesn't call afterCall properly
+   HBASE-5922  HalfStoreFileReader seekBefore causes StackOverflowError (Nate Putnam)
 
   IMPROVEMENTS
    HBASE-5592  Make it easier to get a table from shell (Ben West)
    HBASE-5588  Deprecate/remove AssignmentManager#clearRegionFromTransition
    HBASE-5589  Add of the offline call to the Master Interface
+   HBASE-5436  Right-size the map when reading attributes (Benoit)
+   HBASE-5533  Add more metrics to HBase (Shaneal Manek)
+   HBASE-5734  Change hbck sideline root (Jimmy Xiang)
+   HBASE-5656  LoadIncrementalHFiles createTable should detect and set compression algorithm(Cosmin Lehene)
+   HBASE-5712  Parallelize load of .regioninfo files in diagnostic/repair portion of hbck
+   HBASE-5887  Make TestAcidGuarantees usable for system testing
+   HBASE-5973  Add ability for potentially long-running IPC calls to abort if client disconnects.
 
   NEW FEATURE
    HBASE-5128  [uber hbck] Online automated repair of table integrity and region consistency problems
-
+   HBASE-5599  [hbck] handle NO_VERSION_FILE and SHOULD_NOT_BE_DEPLOYED inconsistencies (fulin wang)
+   HBASE-5719  Enhance hbck to sideline overlapped mega regions (Jimmy Xiang)
 
 Release 0.92.1 - March 17th, 2012
   INCOMPATIBLE CHANGES
@@ -1053,6 +1107,7 @@ Release 0.90.7 - Unreleased
 
   BUG FIXES
    HBASE-5271  Result.getValue and Result.getColumnLatest return the wrong column (Ghais Issa)
+   HBASE-5908  TestHLogSplit.testTralingGarbageCorruptionFileSkipErrorsPasses should not use append to corrupt the HLog (Gregory Chanan)
 
 Release 0.90.6 - Unreleased
 

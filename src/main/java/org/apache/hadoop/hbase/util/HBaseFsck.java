@@ -22,13 +22,17 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -135,6 +139,7 @@ public class HBaseFsck {
   private static final int MAX_NUM_THREADS = 50; // #threads to contact regions
   private static final long THREADS_KEEP_ALIVE_SECONDS = 60;
   private static boolean rsSupportsOffline = true;
+  private static final int DEFAULT_OVERLAPS_TO_SIDELINE = 2;
   private static final int DEFAULT_MAX_MERGE = 5;
 
   /**********************
@@ -147,7 +152,6 @@ public class HBaseFsck {
   private HBaseAdmin admin;
   private HTable meta;
   private ThreadPoolExecutor executor; // threads to retrieve data from regionservers
-  private int numThreads = MAX_NUM_THREADS;
   private long startMillis = System.currentTimeMillis();
 
   /***********
@@ -160,10 +164,13 @@ public class HBaseFsck {
   private boolean fixHdfsHoles = false; // fix fs holes?
   private boolean fixHdfsOverlaps = false; // fix fs overlaps (risky)
   private boolean fixHdfsOrphans = false; // fix fs holes (missing .regioninfo)
+  private boolean fixVersionFile = false; // fix missing hbase.version file in hdfs
 
   // limit fixes to listed tables, if empty atttempt to fix all
   private List<byte[]> tablesToFix = new ArrayList<byte[]>();
   private int maxMerge = DEFAULT_MAX_MERGE; // maximum number of overlapping regions to merge
+  private int maxOverlapsToSideline = DEFAULT_OVERLAPS_TO_SIDELINE; // maximum number of overlapping regions to sideline
+  private boolean sidelineBigOverlaps = false; // sideline overlaps with >maxMerge regions
 
   private boolean rerun = false; // if we tried to fix something, rerun hbck
   private static boolean summary = false; // if we want to print less output
@@ -191,12 +198,12 @@ public class HBaseFsck {
    * detect table consistency problems (holes, dupes, overlaps).  It is sorted
    * to prevent dupes.
    */
-  private TreeMap<String, TableInfo> tablesInfo = new TreeMap<String, TableInfo>();
+  private SortedMap<String, TableInfo> tablesInfo = new ConcurrentSkipListMap<String,TableInfo>();
 
   /**
    * When initially looking at HDFS, we attempt to find any orphaned data.
    */
-  private List<HbckInfo> orphanHdfsDirs = new ArrayList<HbckInfo>();
+  private List<HbckInfo> orphanHdfsDirs = Collections.synchronizedList(new ArrayList<HbckInfo>());
 
   /**
    * Constructor
@@ -209,7 +216,7 @@ public class HBaseFsck {
       ZooKeeperConnectionException, IOException {
     this.conf = conf;
 
-    int numThreads = conf.getInt("hbasefsck.numthreads", Integer.MAX_VALUE);
+    int numThreads = conf.getInt("hbasefsck.numthreads", MAX_NUM_THREADS);
     executor = new ThreadPoolExecutor(1, numThreads,
         THREADS_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
         new SynchronousQueue<Runnable>());
@@ -404,6 +411,11 @@ public class HBaseFsck {
     Path p = hi.getHdfsRegionDir();
     FileSystem fs = p.getFileSystem(conf);
     FileStatus[] dirs = fs.listStatus(p);
+    if (dirs == null) {
+      LOG.warn("Attempt to adopt ophan hdfs region skipped becuase no files present in " +
+          p + ". This dir could probably be deleted.");
+      return ;
+    }
 
     String tableName = Bytes.toString(hi.getTableName());
     TableInfo tableInfo = tablesInfo.get(tableName);
@@ -575,6 +587,12 @@ public class HBaseFsck {
       LOG.warn("No HDFS region dir found: " + hbi + " meta=" + hbi.metaEntry);
       return;
     }
+
+    if (hbi.hdfsEntry.hri != null) {
+      // already loaded data
+      return;
+    }
+
     Path regioninfo = new Path(regionDir, HRegion.REGIONINFO_FILE);
     FileSystem fs = regioninfo.getFileSystem(conf);
 
@@ -602,27 +620,37 @@ public class HBaseFsck {
   /**
    * Populate hbi's from regionInfos loaded from file system.
    */
-  private TreeMap<String, TableInfo> loadHdfsRegionInfos() throws IOException {
+  private SortedMap<String, TableInfo> loadHdfsRegionInfos() throws IOException, InterruptedException {
     tablesInfo.clear(); // regenerating the data
     // generate region split structure
-    for (HbckInfo hbi : regionInfoMap.values()) {
+    Collection<HbckInfo> hbckInfos = regionInfoMap.values();
 
-      // only load entries that haven't been loaded yet.
-      if (hbi.getHdfsHRI() == null) {
-        try {
-          loadHdfsRegioninfo(hbi);
-        } catch (IOException ioe) {
-          String msg = "Orphan region in HDFS: Unable to load .regioninfo from table "
-            + Bytes.toString(hbi.getTableName()) + " in hdfs dir "
-            + hbi.getHdfsRegionDir()
-            + "!  It may be an invalid format or version file.  Treating as "
-            + "an orphaned regiondir.";
-          errors.reportError(ERROR_CODE.ORPHAN_HDFS_REGION, msg);
-          debugLsr(hbi.getHdfsRegionDir());
-          orphanHdfsDirs.add(hbi);
-          continue;
+    // Parallelized read of .regioninfo files.
+    WorkItemHdfsRegionInfo[] hbis = new WorkItemHdfsRegionInfo[hbckInfos.size()];
+    int num = 0;
+    for (HbckInfo hbi : hbckInfos) {
+      hbis[num] = new WorkItemHdfsRegionInfo(hbi, this, errors);
+      executor.execute(hbis[num]);
+      num++;
+    }
+
+    for (int i=0; i < num; i++) {
+      WorkItemHdfsRegionInfo hbi = hbis[i];
+      synchronized(hbi) {
+        while (!hbi.isDone()) {
+          hbi.wait();
         }
       }
+    }
+
+    // serialized table info gathering.
+    for (HbckInfo hbi: hbckInfos) {
+
+      if (hbi.getHdfsHRI() == null) {
+        // was an orphan
+        continue;
+      }
+
 
       // get table name from hdfs, populate various HBaseFsck tables.
       String tableName = Bytes.toString(hbi.getTableName());
@@ -637,10 +665,16 @@ public class HBaseFsck {
         // only executed once per table.
         modTInfo = new TableInfo(tableName);
         Path hbaseRoot = new Path(conf.get(HConstants.HBASE_DIR));
-        HTableDescriptor htd =
-          FSTableDescriptors.getTableDescriptor(hbaseRoot.getFileSystem(conf),
+        try {
+          HTableDescriptor htd =
+              FSTableDescriptors.getTableDescriptor(hbaseRoot.getFileSystem(conf),
               hbaseRoot, tableName);
-        modTInfo.htds.add(htd);
+          modTInfo.htds.add(htd);
+        } catch (IOException ioe) {
+          LOG.error("Unable to read .tableinfo from " + hbaseRoot, ioe);
+          throw ioe;
+        }
+
       }
       modTInfo.addRegionInfo(hbi);
       tablesInfo.put(tableName, modTInfo);
@@ -681,7 +715,7 @@ public class HBaseFsck {
    * 
    * @return An array list of puts to do in bulk, null if tables have problems
    */
-  private ArrayList<Put> generatePuts(TreeMap<String, TableInfo> tablesInfo) throws IOException {
+  private ArrayList<Put> generatePuts(SortedMap<String, TableInfo> tablesInfo) throws IOException {
     ArrayList<Put> puts = new ArrayList<Put>();
     boolean hasProblems = false;
     for (Entry<String, TableInfo> e : tablesInfo.entrySet()) {
@@ -721,7 +755,7 @@ public class HBaseFsck {
   /**
    * Suggest fixes for each table
    */
-  private void suggestFixes(TreeMap<String, TableInfo> tablesInfo) throws IOException {
+  private void suggestFixes(SortedMap<String, TableInfo> tablesInfo) throws IOException {
     for (TableInfo tInfo : tablesInfo.values()) {
       TableIntegrityErrorHandler handler = tInfo.new IntegrityFixSuggester(tInfo, errors);
       tInfo.checkRegionChain(handler);
@@ -792,7 +826,7 @@ public class HBaseFsck {
     return true;
   }
 
-  private TreeMap<String, TableInfo> checkHdfsIntegrity(boolean fixHoles,
+  private SortedMap<String, TableInfo> checkHdfsIntegrity(boolean fixHoles,
       boolean fixOverlaps) throws IOException {
     LOG.info("Checking HBase region split map from HDFS data...");
     for (TableInfo tInfo : tablesInfo.values()) {
@@ -819,7 +853,8 @@ public class HBaseFsck {
 
   private Path getSidelineDir() throws IOException {
     Path hbaseDir = FSUtils.getRootDir(conf);
-    Path backupDir = new Path(hbaseDir.getParent(), hbaseDir.getName() + "-"
+    Path hbckDir = new Path(hbaseDir.getParent(), "hbck");
+    Path backupDir = new Path(hbckDir, hbaseDir.getName() + "-"
         + startMillis);
     return backupDir;
   }
@@ -827,14 +862,14 @@ public class HBaseFsck {
   /**
    * Sideline a region dir (instead of deleting it)
    */
-  void sidelineRegionDir(FileSystem fs, HbckInfo hi)
+  Path sidelineRegionDir(FileSystem fs, HbckInfo hi)
     throws IOException {
     String tableName = Bytes.toString(hi.getTableName());
     Path regionDir = hi.getHdfsRegionDir();
 
     if (!fs.exists(regionDir)) {
       LOG.warn("No previous " + regionDir + " exists.  Continuing.");
-      return;
+      return null;
     }
 
     Path sidelineTableDir= new Path(getSidelineDir(), tableName);
@@ -867,12 +902,15 @@ public class HBaseFsck {
         // dst (foo/a) exists and is a dir, and the src (foo/b) is a dir,
         // it moves the src into the dst dir resulting in (foo/a/b).  If
         // the dst does not exist, and the src a dir, src becomes dst. (foo/b)
-        for (FileStatus hfile : fs.listStatus(src)) {
-          success = fs.rename(hfile.getPath(), dst);
-          if (!success) {
-            String msg = "Unable to rename file " + src +  " to " + dst;
-            LOG.error(msg);
-            throw new IOException(msg);
+        FileStatus[] hfiles = fs.listStatus(src);
+        if (hfiles != null && hfiles.length > 0) {
+          for (FileStatus hfile : hfiles) {
+            success = fs.rename(hfile.getPath(), dst);
+            if (!success) {
+              String msg = "Unable to rename file " + src +  " to " + dst;
+              LOG.error(msg);
+              throw new IOException(msg);
+            }
           }
         }
         LOG.debug("Sideline directory contents:");
@@ -887,6 +925,7 @@ public class HBaseFsck {
       LOG.error(msg);
       throw new IOException(msg);
     }
+    return sidelineRegionDir;
   }
 
   /**
@@ -1000,6 +1039,15 @@ public class HBaseFsck {
     if (!foundVersionFile) {
       errors.reportError(ERROR_CODE.NO_VERSION_FILE,
           "Version file does not exist in root dir " + rootDir);
+      if (shouldFixVersionFile()) {
+        LOG.info("Trying to create a new " + HConstants.VERSION_FILE_NAME
+            + " file.");
+        setShouldRerun();
+        FSUtils.setVersion(fs, rootDir, conf.getInt(
+            HConstants.THREAD_WAKE_FREQUENCY, 10 * 1000), conf.getInt(
+            HConstants.VERSION_FILE_WRITE_ATTEMPTS,
+            HConstants.DEFAULT_VERSION_FILE_WRITE_ATTEMPTS));
+      }
     }
 
     // level 1:  <HBASE_DIR>/*
@@ -1350,10 +1398,14 @@ public class HBaseFsck {
           + " not deployed on any region server.");
       tryAssignmentRepair(hbi, "Trying to fix unassigned region...");
     } else if (inMeta && inHdfs && isDeployed && !shouldBeDeployed) {
-      errors.reportError(ERROR_CODE.SHOULD_NOT_BE_DEPLOYED, "UNHANDLED CASE:" +
-          " Region " + descriptiveName + " should not be deployed according " +
+      errors.reportError(ERROR_CODE.SHOULD_NOT_BE_DEPLOYED, 
+          "Region " + descriptiveName + " should not be deployed according " +
           "to META, but is deployed on " + Joiner.on(", ").join(hbi.deployedOn));
-      // TODO test and handle this case.
+      if (shouldFixAssignments()) {
+        errors.print("Trying to close the region " + descriptiveName);
+        setShouldRerun();
+        HBaseFsckRepair.fixMultiAssignment(admin, hbi.metaEntry, hbi.deployedOn);
+      }
     } else if (inMeta && inHdfs && isMultiplyDeployed) {
       errors.reportError(ERROR_CODE.MULTI_DEPLOYED, "Region " + descriptiveName
           + " is listed in META on region server " + hbi.metaEntry.regionServer
@@ -1395,7 +1447,7 @@ public class HBaseFsck {
    * repeated or overlapping ones.
    * @throws IOException
    */
-  TreeMap<String, TableInfo> checkIntegrity() throws IOException {
+  SortedMap<String, TableInfo> checkIntegrity() throws IOException {
     tablesInfo = new TreeMap<String,TableInfo> ();
     List<HbckInfo> noHDFSRegionInfos = new ArrayList<HbckInfo>();
     LOG.debug("There are " + regionInfoMap.size() + " region info entries");
@@ -1527,6 +1579,9 @@ public class HBaseFsck {
     // backwards regions
     final List<HbckInfo> backwards = new ArrayList<HbckInfo>();
 
+    // sidelined big overlapped regions
+    final Map<Path, HbckInfo> sidelinedRegions = new HashMap<Path, HbckInfo>();
+
     // region split calculator
     final RegionSplitCalculator<HbckInfo> sc = new RegionSplitCalculator<HbckInfo>(cmp);
 
@@ -1548,6 +1603,9 @@ public class HBaseFsck {
     private HTableDescriptor getHTD() {
       if (htds.size() == 1) {
         return (HTableDescriptor)htds.toArray()[0];
+      } else {
+        LOG.error("None/Multiple table descriptors found for table '"
+          + tableName + "' regions: " + htds);
       }
       return null;
     }
@@ -1728,13 +1786,21 @@ public class HBaseFsck {
 
         if (overlap.size() > maxMerge) {
           LOG.warn("Overlap group has " + overlap.size() + " overlapping " +
-              "regions which is greater than " + maxMerge + ", the max " +
-              "number of regions to merge.");
+            "regions which is greater than " + maxMerge + ", the max number of regions to merge");
+          if (sidelineBigOverlaps) {
+            // we only sideline big overlapped groups that exceeds the max number of regions to merge
+            sidelineBigOverlaps(overlap);
+          }
           return;
         }
 
+        mergeOverlaps(overlap);
+      }
+
+      void mergeOverlaps(Collection<HbckInfo> overlap)
+          throws IOException {
         LOG.info("== Merging regions into one region: "
-            + Joiner.on(",").join(overlap));
+          + Joiner.on(",").join(overlap));
         // get the min / max range and close all concerned regions
         Pair<byte[], byte[]> range = null;
         for (HbckInfo hi : overlap) {
@@ -1798,7 +1864,48 @@ public class HBaseFsck {
           fixes++;
         }
       }
-    };
+
+      /**
+       * Sideline some regions in a big overlap group so that it
+       * will have fewer regions, and it is easier to merge them later on.
+       *
+       * @param bigOverlap the overlapped group with regions more than maxMerge
+       * @throws IOException
+       */
+      void sidelineBigOverlaps(
+          Collection<HbckInfo> bigOverlap) throws IOException {
+        int overlapsToSideline = bigOverlap.size() - maxMerge;
+        if (overlapsToSideline > maxOverlapsToSideline) {
+          overlapsToSideline = maxOverlapsToSideline;
+        }
+        List<HbckInfo> regionsToSideline =
+          RegionSplitCalculator.findBigRanges(bigOverlap, overlapsToSideline);
+        FileSystem fs = FileSystem.get(conf);
+        for (HbckInfo regionToSideline: regionsToSideline) {
+          try {
+            LOG.info("Closing region: " + regionToSideline);
+            closeRegion(regionToSideline);
+          } catch (InterruptedException ie) {
+            LOG.warn("Was unable to close region " + regionToSideline.getRegionNameAsString()
+              + ".  Interrupted.");
+            throw new IOException(ie);
+          }
+
+          LOG.info("Offlining region: " + regionToSideline);
+          offline(regionToSideline.getRegionName());
+
+          LOG.info("Before sideline big overlapped region: " + regionToSideline.toString());
+          Path sidelineRegionDir = sidelineRegionDir(fs, regionToSideline);
+          if (sidelineRegionDir != null) {
+            sidelinedRegions.put(sidelineRegionDir, regionToSideline);
+            LOG.info("After sidelined big overlapped region: "
+              + regionToSideline.getRegionNameAsString()
+              + " to " + sidelineRegionDir.toString());
+            fixes++;
+          }
+        }
+      }
+    }
 
     /**
      * Check the region chain (from META) of this table.  We are looking for
@@ -1884,15 +1991,21 @@ public class HBaseFsck {
 
       if (details) {
         // do full region split map dump
-        System.out.println("---- Table '"  +  this.tableName 
+        System.out.println("---- Table '"  +  this.tableName
             + "': region split map");
         dump(splits, regions);
-        System.out.println("---- Table '"  +  this.tableName 
+        System.out.println("---- Table '"  +  this.tableName
             + "': overlap groups");
         dumpOverlapProblems(overlapGroups);
         System.out.println("There are " + overlapGroups.keySet().size()
             + " overlap groups with " + overlapGroups.size()
             + " overlapping regions");
+      }
+      if (!sidelinedRegions.isEmpty()) {
+        LOG.warn("Sidelined big overlapped regions, please bulk load them!");
+        System.out.println("---- Table '"  +  this.tableName
+            + "': sidelined big overlapped regions");
+        dumpSidelinedRegions(sidelinedRegions);
       }
       return errors.getErrorList().size() == originalErrorsCount;
     }
@@ -1926,6 +2039,13 @@ public class HBaseFsck {
             + Bytes.toStringBinary(r.getEndKey()) + "]\n");
       }
       System.out.println("----");
+    }
+  }
+
+  public void dumpSidelinedRegions(Map<Path, HbckInfo> regions) {
+    for (Path k : regions.keySet()) {
+      System.out.println("To be bulk loaded sidelined region dir: "
+        + k.toString());
     }
   }
 
@@ -1965,7 +2085,7 @@ public class HBaseFsck {
   }
 
    HTableDescriptor[] getHTableDescriptors(List<String> tableNames) {
-    HTableDescriptor[] htd = null;
+    HTableDescriptor[] htd = new HTableDescriptor[0];
      try {
        LOG.info("getHTableDescriptors == tableNames => " + tableNames);
        htd = new HBaseAdmin(conf).getTableDescriptors(tableNames);
@@ -2347,7 +2467,7 @@ public class HBaseFsck {
   /**
    * Prints summary of all tables found on the system.
    */
-  private void printTableSummary(TreeMap<String, TableInfo> tablesInfo) {
+  private void printTableSummary(SortedMap<String, TableInfo> tablesInfo) {
     System.out.println("Summary:");
     for (TableInfo tInfo : tablesInfo.values()) {
       if (errors.tableHasErrors(tInfo)) {
@@ -2647,6 +2767,58 @@ public class HBaseFsck {
   }
 
   /**
+   * Contact hdfs and get all information about specified table directory into
+   * regioninfo list.
+   */
+  static class WorkItemHdfsRegionInfo implements Runnable {
+    private HbckInfo hbi;
+    private HBaseFsck hbck;
+    private ErrorReporter errors;
+    private boolean done;
+
+    WorkItemHdfsRegionInfo(HbckInfo hbi, HBaseFsck hbck, ErrorReporter errors) {
+      this.hbi = hbi;
+      this.hbck = hbck;
+      this.errors = errors;
+      this.done = false;
+    }
+
+    synchronized boolean isDone() {
+      return done;
+    }
+
+    @Override
+    public synchronized void run() {
+      try {
+        // only load entries that haven't been loaded yet.
+        if (hbi.getHdfsHRI() == null) {
+          try {
+            hbck.loadHdfsRegioninfo(hbi);
+          } catch (IOException ioe) {
+            String msg = "Orphan region in HDFS: Unable to load .regioninfo from table "
+                + Bytes.toString(hbi.getTableName()) + " in hdfs dir "
+                + hbi.getHdfsRegionDir()
+                + "!  It may be an invalid format or version file.  Treating as "
+                + "an orphaned regiondir.";
+            errors.reportError(ERROR_CODE.ORPHAN_HDFS_REGION, msg);
+            try {
+              hbck.debugLsr(hbi.getHdfsRegionDir());
+            } catch (IOException ioe2) {
+              LOG.error("Unable to read directory " + hbi.getHdfsRegionDir(), ioe2);
+              return; // TODO convert this in to a future
+            }
+            hbck.orphanHdfsDirs.add(hbi);
+            return;
+          }
+        }
+      } finally {
+        done = true;
+        notifyAll();
+      }
+    }
+  };
+
+  /**
    * Display the full report from fsck. This displays all live and dead region
    * servers, and all known regions.
    */
@@ -2727,6 +2899,22 @@ public class HBaseFsck {
   boolean shouldFixHdfsOrphans() {
     return fixHdfsOrphans;
   }
+  
+  public void setFixVersionFile(boolean shouldFix) {
+    fixVersionFile = shouldFix;
+  }
+
+  public boolean shouldFixVersionFile() {
+    return fixVersionFile;
+  }
+
+  public void setSidelineBigOverlaps(boolean sbo) {
+    this.sidelineBigOverlaps = sbo;
+  }
+
+  public boolean shouldSidelineBigOverlaps() {
+    return sidelineBigOverlaps;
+  }
 
   /**
    * @param mm maximum number of regions to merge into a single region.
@@ -2737,6 +2925,14 @@ public class HBaseFsck {
 
   public int getMaxMerge() {
     return maxMerge;
+  }
+
+  public void setMaxOverlapsToSideline(int mo) {
+    this.maxOverlapsToSideline = mo;
+  }
+
+  public int getMaxOverlapsToSideline() {
+    return maxOverlapsToSideline;
   }
 
   /**
@@ -2770,6 +2966,7 @@ public class HBaseFsck {
   protected static void printUsageAndExit() {
     System.err.println("Usage: fsck [opts] {only tables}");
     System.err.println(" where [opts] are:");
+    System.err.println("   -help Display help options (this)");
     System.err.println("   -details Display full report of all regions.");
     System.err.println("   -timelag {timeInSeconds}  Process only regions that " +
                        " have not experienced any metadata updates in the last " +
@@ -2786,9 +2983,12 @@ public class HBaseFsck {
     System.err.println("   -fixHdfsHoles     Try to fix region holes in hdfs.");
     System.err.println("   -fixHdfsOrphans   Try to fix region dirs with no .regioninfo file in hdfs");
     System.err.println("   -fixHdfsOverlaps  Try to fix region overlaps in hdfs.");
+    System.err.println("   -fixVersionFile   Try to fix missing hbase.version file in hdfs.");
     System.err.println("   -maxMerge <n>     When fixing region overlaps, allow at most <n> regions to merge. (n=" + DEFAULT_MAX_MERGE +" by default)");
+    System.err.println("   -sidelineBigOverlaps  When fixing region overlaps, allow to sideline big overlaps");
+    System.err.println("   -maxOverlapsToSideline <n>  When fixing region overlaps, allow at most <n> regions to sideline per group. (n=" + DEFAULT_OVERLAPS_TO_SIDELINE +" by default)");
     System.err.println("");
-    System.err.println("   -repair           Shortcut for -fixAssignments -fixMeta -fixHdfsHoles -fixHdfsOrphans -fixHdfsOverlaps");
+    System.err.println("   -repair           Shortcut for -fixAssignments -fixMeta -fixHdfsHoles -fixHdfsOrphans -fixHdfsOverlaps -fixVersionFile -sidelineBigOverlaps");
     System.err.println("   -repairHoles      Shortcut for -fixAssignments -fixMeta -fixHdfsHoles -fixHdfsOrphans");
 
     Runtime.getRuntime().exit(-2);
@@ -2810,7 +3010,9 @@ public class HBaseFsck {
     // Process command-line args.
     for (int i = 0; i < args.length; i++) {
       String cmd = args[i];
-      if (cmd.equals("-details")) {
+      if (cmd.equals("-help") || cmd.equals("-h")) {
+        printUsageAndExit();
+      } else if (cmd.equals("-details")) {
         fsck.setDisplayFullReport();
       } else if (cmd.equals("-timelag")) {
         if (i == args.length - 1) {
@@ -2851,6 +3053,10 @@ public class HBaseFsck {
         fsck.setFixHdfsOrphans(true);
       } else if (cmd.equals("-fixHdfsOverlaps")) {
         fsck.setFixHdfsOverlaps(true);
+      } else if (cmd.equals("-fixVersionFile")) {
+        fsck.setFixVersionFile(true);
+      } else if (cmd.equals("-sidelineBigOverlaps")) {
+        fsck.setSidelineBigOverlaps(true);
       } else if (cmd.equals("-repair")) {
         // this attempts to merge overlapping hdfs regions, needs testing
         // under load
@@ -2859,6 +3065,8 @@ public class HBaseFsck {
         fsck.setFixMeta(true);
         fsck.setFixAssignments(true);
         fsck.setFixHdfsOverlaps(true);
+        fsck.setFixVersionFile(true);
+        fsck.setSidelineBigOverlaps(true);
       } else if (cmd.equals("-repairHoles")) {
         // this will make all missing hdfs regions available but may lose data
         fsck.setFixHdfsHoles(true);
@@ -2866,6 +3074,20 @@ public class HBaseFsck {
         fsck.setFixMeta(true);
         fsck.setFixAssignments(true);
         fsck.setFixHdfsOverlaps(false);
+        fsck.setSidelineBigOverlaps(false);
+      } else if (cmd.equals("-maxOverlapsToSideline")) {
+        if (i == args.length - 1) {
+          System.err.println("-maxOverlapsToSideline needs a numeric value argument.");
+          printUsageAndExit();
+        }
+        try {
+          int maxOverlapsToSideline = Integer.parseInt(args[i+1]);
+          fsck.setMaxOverlapsToSideline(maxOverlapsToSideline);
+        } catch (NumberFormatException e) {
+          System.err.println("-maxOverlapsToSideline needs a numeric value argument.");
+          printUsageAndExit();
+        }
+        i++;
       } else if (cmd.equals("-maxMerge")) {
         if (i == args.length - 1) {
           System.err.println("-maxMerge needs a numeric value argument.");
@@ -2883,6 +3105,9 @@ public class HBaseFsck {
         fsck.setSummary();
       } else if (cmd.equals("-metaonly")) {
         fsck.setCheckMetaOnly();
+      } else if (cmd.startsWith("-")) {
+        System.err.println("Unrecognized option:" + cmd);
+        printUsageAndExit();
       } else {
         byte[] table = Bytes.toBytes(cmd);
         fsck.includeTable(table);
@@ -2908,6 +3133,7 @@ public class HBaseFsck {
       fsck.setFixMeta(false);
       fsck.setFixHdfsHoles(false);
       fsck.setFixHdfsOverlaps(false);
+      fsck.setFixVersionFile(false);
       fsck.errors.resetErrors();
       code = fsck.onlineHbck();
     }

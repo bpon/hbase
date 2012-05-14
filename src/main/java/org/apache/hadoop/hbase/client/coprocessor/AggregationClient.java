@@ -94,7 +94,7 @@ public class AggregationClient {
 
       @Override
       public synchronized void update(byte[] region, byte[] row, R result) {
-        max = ci.compare(max, result) < 0 ? result : max;
+        max = (max == null || (result != null && ci.compare(max, result) < 0)) ? result : max;
       }
     }
     MaxCallBack aMaxCallBack = new MaxCallBack();
@@ -112,7 +112,8 @@ public class AggregationClient {
     if (scan == null
         || (Bytes.equals(scan.getStartRow(), scan.getStopRow()) && !Bytes
             .equals(scan.getStartRow(), HConstants.EMPTY_START_ROW))
-        || Bytes.compareTo(scan.getStartRow(), scan.getStopRow()) > 0) {
+        || ((Bytes.compareTo(scan.getStartRow(), scan.getStopRow()) > 0) &&
+        	!Bytes.equals(scan.getStopRow(), HConstants.EMPTY_END_ROW))) {
       throw new IOException(
           "Agg client Exception: Startrow should be smaller than Stoprow");
     } else if (scan.getFamilyMap().size() != 1) {
@@ -143,7 +144,7 @@ public class AggregationClient {
 
       @Override
       public synchronized void update(byte[] region, byte[] row, R result) {
-        min = (min == null || ci.compare(result, min) < 0) ? result : min;
+        min = (min == null || (result != null && ci.compare(result, min) < 0)) ? result : min;
       }
     }
     HTable table = new HTable(conf, tableName);

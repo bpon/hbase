@@ -25,6 +25,8 @@ import java.lang.reflect.InvocationTargetException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -50,6 +52,7 @@ import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HServerLoad;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.MasterNotRunningException;
+import org.apache.hadoop.hbase.PleaseHoldException;
 import org.apache.hadoop.hbase.Server;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableDescriptors;
@@ -92,6 +95,7 @@ import org.apache.hadoop.hbase.util.HasThread;
 import org.apache.hadoop.hbase.util.InfoServer;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.Sleeper;
+import org.apache.hadoop.hbase.util.Strings;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.util.VersionInfo;
 import org.apache.hadoop.hbase.zookeeper.ClusterId;
@@ -232,9 +236,9 @@ Server {
     // Set how many times to retry talking to another server over HConnection.
     HConnectionManager.setServerSideHConnectionRetries(this.conf, LOG);
     // Server to handle client requests.
-    String hostname = DNS.getDefaultHost(
+    String hostname = Strings.domainNamePointerToHostName(DNS.getDefaultHost(
       conf.get("hbase.master.dns.interface", "default"),
-      conf.get("hbase.master.dns.nameserver", "default"));
+      conf.get("hbase.master.dns.nameserver", "default")));
     int port = conf.getInt(HConstants.MASTER_PORT, HConstants.DEFAULT_MASTER_PORT);
     // Creation of a HSA will force a resolve.
     InetSocketAddress initialIsa = new InetSocketAddress(hostname, port);
@@ -339,7 +343,17 @@ Server {
         loop();
       }
     } catch (Throwable t) {
-      abort("Unhandled exception. Starting shutdown.", t);
+      // HBASE-5680: Likely hadoop23 vs hadoop 20.x/1.x incompatibility
+      if (t instanceof NoClassDefFoundError && 
+          t.getMessage().contains("org/apache/hadoop/hdfs/protocol/FSConstants$SafeModeAction")) {
+          // improved error message for this special case
+          abort("HBase is having a problem with its Hadoop jars.  You may need to "
+              + "recompile HBase against Hadoop version "
+              +  org.apache.hadoop.util.VersionInfo.getVersion()
+              + " or change your hadoop jars to start properly", t);
+      } else {
+        abort("Unhandled exception. Starting shutdown.", t);
+      }
     } finally {
       startupStatus.cleanup();
       
@@ -376,7 +390,14 @@ Server {
         this);
     this.zooKeeper.registerListener(activeMasterManager);
     stallIfBackupMaster(this.conf, this.activeMasterManager);
-    return this.activeMasterManager.blockUntilBecomingActiveMaster(startupStatus);
+    
+    // The ClusterStatusTracker is setup before the other
+    // ZKBasedSystemTrackers because it's needed by the activeMasterManager
+    // to check if the cluster should be shutdown.
+    this.clusterStatusTracker = new ClusterStatusTracker(getZooKeeper(), this);
+    this.clusterStatusTracker.start();
+    return this.activeMasterManager.blockUntilBecomingActiveMaster(startupStatus,
+        this.clusterStatusTracker);
   }
 
   /**
@@ -405,8 +426,6 @@ Server {
 
     // Set the cluster as up.  If new RSs, they'll be waiting on this before
     // going ahead with their startup.
-    this.clusterStatusTracker = new ClusterStatusTracker(getZooKeeper(), this);
-    this.clusterStatusTracker.start();
     boolean wasUp = this.clusterStatusTracker.isClusterUp();
     if (!wasUp) this.clusterStatusTracker.setClusterUp();
 
@@ -494,6 +513,7 @@ Server {
       }
     }
 
+    this.assignmentManager.startTimeOutMonitor();
     Set<ServerName> onlineServers = new HashSet<ServerName>(serverManager
         .getOnlineServers().keySet());
     // TODO: Should do this in background rather than block master startup
@@ -1040,6 +1060,7 @@ Server {
     }
 
     HRegionInfo [] newRegions = getHRegionInfos(hTableDescriptor, splitKeys);
+    checkInitialized();
     if (cpHost != null) {
       cpHost.preCreateTable(hTableDescriptor, newRegions);
     }
@@ -1081,6 +1102,7 @@ Server {
 
   @Override
   public void deleteTable(final byte [] tableName) throws IOException {
+    checkInitialized();
     if (cpHost != null) {
       cpHost.preDeleteTable(tableName);
     }
@@ -1102,6 +1124,7 @@ Server {
 
   public void addColumn(byte [] tableName, HColumnDescriptor column)
   throws IOException {
+    checkInitialized();
     if (cpHost != null) {
       if (cpHost.preAddColumn(tableName, column)) {
         return;
@@ -1115,6 +1138,7 @@ Server {
 
   public void modifyColumn(byte [] tableName, HColumnDescriptor descriptor)
   throws IOException {
+    checkInitialized();
     if (cpHost != null) {
       if (cpHost.preModifyColumn(tableName, descriptor)) {
         return;
@@ -1128,6 +1152,7 @@ Server {
 
   public void deleteColumn(final byte [] tableName, final byte [] c)
   throws IOException {
+    checkInitialized();
     if (cpHost != null) {
       if (cpHost.preDeleteColumn(tableName, c)) {
         return;
@@ -1140,6 +1165,7 @@ Server {
   }
 
   public void enableTable(final byte [] tableName) throws IOException {
+    checkInitialized();
     if (cpHost != null) {
       cpHost.preEnableTable(tableName);
     }
@@ -1152,6 +1178,7 @@ Server {
   }
 
   public void disableTable(final byte [] tableName) throws IOException {
+    checkInitialized();
     if (cpHost != null) {
       cpHost.preDisableTable(tableName);
     }
@@ -1201,6 +1228,7 @@ Server {
   @Override
   public void modifyTable(final byte[] tableName, HTableDescriptor htd)
   throws IOException {
+    checkInitialized();
     if (cpHost != null) {
       cpHost.preModifyTable(tableName, htd);
     }
@@ -1251,8 +1279,20 @@ Server {
     List<ServerName> backupMasters = new ArrayList<ServerName>(
                                           backupMasterStrings.size());
     for (String s: backupMasterStrings) {
-      backupMasters.add(new ServerName(s));
+      try {
+        byte[] bytes = ZKUtil.getData(this.zooKeeper, ZKUtil.joinZNode(this.zooKeeper.backupMasterAddressesZNode, s));
+        if (bytes != null) {
+          backupMasters.add(ServerName.parseVersionedServerName(bytes));
+        }
+      } catch (KeeperException e) {
+        LOG.warn(this.zooKeeper.prefix("Unable to get information about " +
+                 "backup servers"), e);
+      }
     }
+    Collections.sort(backupMasters, new Comparator<ServerName>() {
+      public int compare(ServerName s1, ServerName s2) {
+        return s1.getServerName().compareTo(s2.getServerName());
+      }});
 
     return new ClusterStatus(VersionInfo.getVersion(),
       this.fileSystemManager.getClusterId(),
@@ -1491,6 +1531,11 @@ Server {
     return this.abort;
   }
   
+  void checkInitialized() throws PleaseHoldException {
+    if (!this.initialized) {
+      throw new PleaseHoldException("Master is initializing");
+    }
+  }
   
   /**
    * Report whether this master is currently the active master or not.
@@ -1535,6 +1580,7 @@ Server {
 
   @Override
   public void assign(final byte [] regionName)throws IOException {
+    checkInitialized();
     Pair<HRegionInfo, ServerName> pair =
       MetaReader.getRegion(this.catalogTracker, regionName);
     if (pair == null) throw new UnknownRegionException(Bytes.toString(regionName));
@@ -1558,6 +1604,7 @@ Server {
   @Override
   public void unassign(final byte [] regionName, final boolean force)
   throws IOException {
+    checkInitialized();
     Pair<HRegionInfo, ServerName> pair =
       MetaReader.getRegion(this.catalogTracker, regionName);
     if (pair == null) throw new UnknownRegionException(Bytes.toString(regionName));

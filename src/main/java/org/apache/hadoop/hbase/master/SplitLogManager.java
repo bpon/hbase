@@ -394,6 +394,14 @@ public class SplitLogManager extends ZooKeeperListener {
     tot_mgr_get_data_queued.incrementAndGet();
   }
 
+  private void tryGetDataSetWatch(String path) {
+    // A negative retry count will lead to ignoring all error processing.
+    this.watcher.getRecoverableZooKeeper().getZooKeeper().
+        getData(path, this.watcher,
+        new GetDataAsyncCallback(), new Long(-1) /* retry count */);
+    tot_mgr_get_data_queued.incrementAndGet();
+  }
+
   private void getDataSetWatchSuccess(String path, byte[] data, int version) {
     if (data == null) {
       if (version == Integer.MIN_VALUE) {
@@ -521,12 +529,18 @@ public class SplitLogManager extends ZooKeeperListener {
           version) == false) {
         LOG.debug("failed to resubmit task " + path +
             " version changed");
+        task.heartbeatNoDetails(EnvironmentEdgeManager.currentTimeMillis());
         return false;
       }
     } catch (NoNodeException e) {
       LOG.warn("failed to resubmit because znode doesn't exist " + path +
           " task done (or forced done by removing the znode)");
       getDataSetWatchSuccess(path, null, Integer.MIN_VALUE);
+      return false;
+    } catch (KeeperException.BadVersionException e) {
+      LOG.debug("failed to resubmit task " + path +
+          " version changed");
+      task.heartbeatNoDetails(EnvironmentEdgeManager.currentTimeMillis());
       return false;
     } catch (KeeperException e) {
       tot_mgr_resubmit_failed.incrementAndGet();
@@ -698,7 +712,12 @@ public class SplitLogManager extends ZooKeeperListener {
 
   @Override
   public void nodeDataChanged(String path) {
-    if (tasks.get(path) != null || ZKSplitLog.isRescanNode(watcher, path)) {
+    Task task;
+    task = tasks.get(path);
+    if (task != null || ZKSplitLog.isRescanNode(watcher, path)) {
+      if (task != null) {
+        task.heartbeatNoDetails(EnvironmentEdgeManager.currentTimeMillis());
+      }
       getDataSetWatch(path, zkretries);
     }
   }
@@ -794,7 +813,11 @@ public class SplitLogManager extends ZooKeeperListener {
     }
 
     public boolean isUnassigned() {
-      return (last_update == -1);
+      return (cur_worker_name == null);
+    }
+
+    public void heartbeatNoDetails(long time) {
+      last_update = time;
     }
 
     public void heartbeat(long time, int version, String worker) {
@@ -892,11 +915,13 @@ public class SplitLogManager extends ZooKeeperListener {
         for (Map.Entry<String, Task> e : tasks.entrySet()) {
           String path = e.getKey();
           Task task = e.getValue();
-          // we have to do this check again because tasks might have
-          // been asynchronously assigned.
-          if (task.isUnassigned()) {
+          // we have to do task.isUnassigned() check again because tasks might
+          // have been asynchronously assigned. There is no locking required
+          // for these checks ... it is OK even if tryGetDataSetWatch() is
+          // called unnecessarily for a task
+          if (task.isUnassigned() && (task.status != FAILURE)) {
             // We just touch the znode to make sure its still there
-            getDataSetWatch(path, zkretries);
+            tryGetDataSetWatch(path);
           }
         }
         createRescanNode(Long.MAX_VALUE);
@@ -966,6 +991,12 @@ public class SplitLogManager extends ZooKeeperListener {
           return;
         }
         Long retry_count = (Long) ctx;
+
+        if (retry_count < 0) {
+          LOG.warn("getdata rc = " + KeeperException.Code.get(rc) + " " +
+              path + ". Ignoring error. No error handling. No retrying.");
+          return;
+        }
         LOG.warn("getdata rc = " + KeeperException.Code.get(rc) + " " +
             path + " retry=" + retry_count);
         if (retry_count == 0) {

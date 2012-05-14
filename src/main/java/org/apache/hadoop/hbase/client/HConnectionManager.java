@@ -1322,8 +1322,11 @@ public class HConnectionManager {
         try {
           callable.beforeCall();
           callable.connect(tries != 0);
-          return callable.call();
+          T result = callable.call();
+          callable.afterCall();
+          return result;
         } catch (Throwable t) {
+          callable.afterCall();
           callable.shouldRetry(t);
           t = translateException(t);
           if (t instanceof SocketTimeoutException ||
@@ -1344,8 +1347,6 @@ public class HConnectionManager {
           if (tries == numRetries - 1) {
             throw new RetriesExhaustedException(tries, exceptions);
           }
-        } finally {
-          callable.afterCall();
         }
         try {
           Thread.sleep(getPauseTime(tries));
@@ -1848,6 +1849,7 @@ public class HConnectionManager {
     }
 
     public HTableDescriptor[] getHTableDescriptors(List<String> tableNames) throws IOException {
+      if (tableNames == null || tableNames.isEmpty()) return new HTableDescriptor[0];
       if (tableNames == null || tableNames.size() == 0) return null;
       if (this.master == null) {
         this.master = getMaster();
